@@ -1,5 +1,4 @@
 # ===============================================================
-# ===============================================================
 # Johnston (1991) Stereo Shape Distortion RDS Experiment
 # FINAL WINDOWS HAPLOSCOPE DEMO — with NONIUS + FUSION PRIME
 #   • Nonius bars (alignment helper) in TEST MODE + fusion prime
@@ -300,4 +299,3 @@ for trial in trials:
 
 # ============================ CLEANUP ============================
 terminate_experiment()
-
