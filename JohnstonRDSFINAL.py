@@ -1,4 +1,5 @@
 # ===============================================================
+# ===============================================================
 # Johnston (1991) Stereo Shape Distortion RDS Experiment
 # FINAL WINDOWS HAPLOSCOPE DEMO — with NONIUS + FUSION PRIME
 #   • Nonius bars (alignment helper) in TEST MODE + fusion prime
@@ -18,8 +19,11 @@ LEFT_SCREEN_INDEX  = 1
 
 TEST_MODE    = True       # 10s convex cylinder + nonius to verify mapping/fusion
 DYNAMIC_RDS  = False      # True = new random dots each frame. You don't need it for fusion.
+DYNAMIC_RDS_UPDATE_EVERY = 2  # regenerate every N frames when DYNAMIC_RDS=True (cuts GPU cost)
+DYNAMIC_RDS_BANK_SIZE = 12    # number of pre-generated frames to cycle when dynamic noise is enabled
 POST_FIX_SEC = 0.3        # post-stim fixation to standardize decision time
 FUSION_PRIME_SEC = 0.4    # zero-disparity noise before each stimulus — locks vergence
+MEASURE_BOTH_REFRESH = False  # set True if panels have very different refresh caps
 # =============================================================
 
 # === Participant dialog (enter physical params, dot size, etc.) ===
@@ -45,52 +49,7 @@ exp_info["expName"] = "JohnstonRDS"
 
 # === Data files ===
 os.makedirs("data", exist_ok=True)
-filename = os.path.join("data", f"{exp_info['participant']}_{exp_info['date']}")
-this_exp = data.ExperimentHandler(name=exp_info["expName"], extraInfo=exp_info, dataFileName=filename)
-
-# ========================== MONITOR ===========================
-screen_distance_cm = float(exp_info["screen_distance_cm"])
-screen_width_cm    = float(exp_info["screen_width_cm"])
-interocular_cm     = float(exp_info["interocular_distance_cm"])
-monitor_res_px     = (3840, 2160)  # set to your panels’ native resolution
-dot_size_cm        = float(exp_info["dot_size_cm"])
-
-# Haploscope calibration
-haplo_offset_cm = float(exp_info["haploscope_offset_cm"])
-scale_single    = float(exp_info["haploscope_scale_x"])
-scale_x_left    = float(exp_info.get("haploscope_scale_x_left",  scale_single))
-scale_x_right   = float(exp_info.get("haploscope_scale_x_right", scale_single))
-
-# PsychoPy Monitor (tells PsychoPy real cm & px)
-haplo_monitor = monitors.Monitor("haploscope", width=screen_width_cm, distance=screen_distance_cm)
-haplo_monitor.setSizePix(monitor_res_px)
-
-# === Create windows — RIGHT first, then LEFT (driver-friendly order) ===
-win_right = visual.Window(
-    size=monitor_res_px, screen=RIGHT_SCREEN_INDEX, fullscr=True,
-    units="cm", color=[-1, -1, -1], winType=WIN_TYPE, waitBlanking=True,
-    monitor=haplo_monitor, pos=(0, 0)
-)
-core.wait(0.2)  # small settle
-win_left = visual.Window(
-    size=monitor_res_px, screen=LEFT_SCREEN_INDEX, fullscr=True,
-    units="cm", color=[-1, -1, -1], winType=WIN_TYPE, waitBlanking=True,
-    monitor=haplo_monitor, pos=(0, 0)
-)
-
-# Hide cursors
-win_left.mouseVisible = False
-win_right.mouseVisible = False
-
-# Per-eye stretch compensation (keep both 1.0 unless asymmetry in optics)
-win_left.viewScale  = [scale_x_left,  1.0]
-win_right.viewScale = [scale_x_right, 1.0]
-
-# ================== CLEAN EXIT (ESC works anywhere) =================
-_experiment_terminated = {"value": False}
-def terminate_experiment():
-    if _experiment_terminated["value"]:
-        return
+@@ -94,105 +97,128 @@ def terminate_experiment():
     _experiment_terminated["value"] = True
     try:
         this_exp.saveAsWideText(filename + ".csv")
@@ -116,9 +75,12 @@ stim_half_height_cm = 6.0   # cylinder half-height (vertical)
 aperture_radius_cm = 10.0   # dot field radius (bigger field = easier fusion)
 # ====================================================================
 
-# === Measure per-eye refresh; schedule to the slower eye ===
-fr_left  = win_left.getActualFrameRate(nIdentical=90, nWarmUpFrames=60)  or 60.0
-fr_right = win_right.getActualFrameRate(nIdentical=90, nWarmUpFrames=60) or 60.0
+# === Measure refresh; optionally skip the second probe to speed up launch ===
+fr_left = win_left.getActualFrameRate(nIdentical=90, nWarmUpFrames=60) or 60.0
+if MEASURE_BOTH_REFRESH:
+    fr_right = win_right.getActualFrameRate(nIdentical=90, nWarmUpFrames=60) or 60.0
+else:
+    fr_right = fr_left
 refresh_min_hz = min(fr_left, fr_right)
 stim_frames = int(round(stim_duration_s * refresh_min_hz))
 print(f"Refresh L:{fr_left:.2f}Hz R:{fr_right:.2f}Hz → scheduling {stim_frames} frames ({stim_duration_s:.2f}s)")
@@ -137,40 +99,60 @@ def project_to_screen(x_cm, z_cm, distance_cm, iod_cm):
     disp_formula = (iod_cm * safe_z) / ((distance_cm**2) - (safe_z**2))
     return xL, xR, disp_cm, disp_rad, disp_formula
 
-def generate_rds(a, b, dist, iod, n, y_semi, aperture, width):
+def generate_rds(a, b, dist, iod, n, y_semi, aperture, width, offset_cm=None):
     """Return per-eye dot coordinates for a half-elliptical cylinder RDS + disparity stats."""
     half_width = width / 2.0
-    xL_all, xR_all, y_all = [], [], []
-    dcm_all, dang_all, dfor_all = [], [], []
+    offset_cm = haplo_offset_cm if offset_cm is None else offset_cm
 
-    needed = n
-    while needed > 0:
-        batch = int(np.ceil(needed * 1.6))
-        theta = np.random.uniform(0, 2*np.pi, batch)
+    xL_chunks, xR_chunks, y_chunks = [], [], []
+    dcm_chunks, dang_chunks, dfor_chunks = [], [], []
+
+    collected = 0
+    while collected < n:
+        remaining = n - collected
+        batch = max(int(np.ceil(remaining * 1.6)), 64)
+        theta = np.random.uniform(0, 2 * np.pi, batch)
         r = aperture * np.sqrt(np.random.uniform(0, 1, batch))
-        x, y = r*np.cos(theta), r*np.sin(theta)
+        x, y = r * np.cos(theta), r * np.sin(theta)
 
         # Half-cylinder surface: inside ellipse gets z>0 (bulges toward observer), outside z=0
         inside = ((x / a) ** 2 + (y / y_semi) ** 2) <= 1.0
         z = np.zeros_like(x)
         if np.any(inside):
             xin = x[inside]
-            z[inside] = b * np.sqrt(np.clip(1 - (xin / a)**2, 0, None))
+            z[inside] = b * np.sqrt(np.clip(1 - (xin / a) ** 2, 0, None))
 
         xL, xR, dcm, dang, dfor = project_to_screen(x, z, dist, iod)
-        # Haploscope horizontal calibration (equal and opposite shifts)
-        xL -= haplo_offset_cm
-        xR += haplo_offset_cm
+        if offset_cm:
+            # Haploscope horizontal calibration (equal and opposite shifts)
+            xL -= offset_cm
+            xR += offset_cm
 
         # Keep only dots visible to BOTH eyes (prevents monocular ghosts)
         keep = (np.abs(xL) <= half_width) & (np.abs(xR) <= half_width)
-        xL_all.append(xL[keep]); xR_all.append(xR[keep]); y_all.append(y[keep])
-        dcm_all.append(dcm[keep]); dang_all.append(dang[keep]); dfor_all.append(dfor[keep])
+        kept = int(np.count_nonzero(keep))
+        if kept == 0:
+            continue
 
-        needed = n - sum(len(chunk) for chunk in xL_all)
+        xL_chunks.append(xL[keep])
+        xR_chunks.append(xR[keep])
+        y_chunks.append(y[keep])
+        dcm_chunks.append(dcm[keep])
+        dang_chunks.append(dang[keep])
+        dfor_chunks.append(dfor[keep])
+        collected += kept
 
-    xL = np.concatenate(xL_all)[:n]; xR = np.concatenate(xR_all)[:n]; y = np.concatenate(y_all)[:n]
-    dcm = np.concatenate(dcm_all)[:n]; dang = np.concatenate(dang_all)[:n]; dfor = np.concatenate(dfor_all)[:n]
+    def _cat(chunks):
+        if len(chunks) == 1:
+            return chunks[0][:n]
+        return np.concatenate(chunks, axis=0)[:n]
+
+    xL = _cat(xL_chunks)
+    xR = _cat(xR_chunks)
+    y = _cat(y_chunks)
+    dcm = _cat(dcm_chunks)
+    dang = _cat(dang_chunks)
+    dfor = _cat(dfor_chunks)
     return xL, xR, y, dcm, dang, dfor
 # ====================================================================
 
@@ -196,20 +178,7 @@ if TEST_MODE:
     print("TEST MODE: 10 s convex cylinder + nonius bars. Swap LEFT/RIGHT indices if it looks concave.")
     b_test = 9.95
     xL, xR, y, *_ = generate_rds(a_cm, b_test, screen_distance_cm, interocular_cm,
-                                 n_dots, stim_half_height_cm, aperture_radius_cm, screen_width_cm)
-    dotsL = visual.ElementArrayStim(win_left,  nElements=n_dots, elementTex=None, elementMask="circle",
-                                    xys=np.column_stack((xL, y)), sizes=max(dot_size_cm, 0.25), colors="white")
-    dotsR = visual.ElementArrayStim(win_right, nElements=n_dots, elementTex=None, elementMask="circle",
-                                    xys=np.column_stack((xR, y)), sizes=max(dot_size_cm, 0.25), colors="white")
-    clock = core.Clock()
-    while clock.getTime() < 10:
-        # Draw fixation + NONIUS + big cylinder
-        fix_left.draw();  fix_right.draw()
-        nonius_left.draw(); nonius_right.draw()
-        dotsL.draw(); dotsR.draw()
-        win_left.flip(); win_right.flip()
-        if default_kb.getKeys(["escape"], waitRelease=False): terminate_experiment()
-
+@@ -213,104 +239,122 @@ if TEST_MODE:
     print("Adjust 'haploscope_offset_cm' until the nonius bars form ONE straight line. Press any key to continue...")
     while not kb.getKeys(waitRelease=False):
         fix_left.draw();  fix_right.draw()
@@ -235,7 +204,8 @@ for trial in trials:
     xL_p, xR_p, y_p, *_ = generate_rds(
         a_cm, 0.0,  # b=0 → flat plane at the screen → xL==xR in projection
         screen_distance_cm, interocular_cm,
-        n_dots, stim_half_height_cm, aperture_radius_cm, screen_width_cm
+        n_dots, stim_half_height_cm, aperture_radius_cm, screen_width_cm,
+        offset_cm=0.0  # force zero-disparity regardless of haploscope offset
     )
     prime_xy = np.column_stack((xL_p, y_p))  # identical positions to both eyes → guarantees zero disparity
     primeL = visual.ElementArrayStim(win_left,  nElements=n_dots, elementTex=None, elementMask="circle",
@@ -253,10 +223,19 @@ for trial in trials:
 
     # ---------------------- CYLINDER STIMULUS -----------------------------
     # Generate one static RDS for this condition (unless DYNAMIC_RDS=True)
-    xL, xR, y, dcm, dang, dfor = generate_rds(
-        a_cm, b, screen_distance_cm, interocular_cm,
-        n_dots, stim_half_height_cm, aperture_radius_cm, screen_width_cm
-    )
+    def regenerate_cylinder():
+        return generate_rds(
+            a_cm, b, screen_distance_cm, interocular_cm,
+            n_dots, stim_half_height_cm, aperture_radius_cm, screen_width_cm
+        )
+
+    if DYNAMIC_RDS:
+        bank_len = max(int(DYNAMIC_RDS_BANK_SIZE), 1)
+        rds_bank = [regenerate_cylinder() for _ in range(bank_len)]
+        bank_index = 0
+        xL, xR, y, dcm, dang, dfor = rds_bank[bank_index]
+    else:
+        xL, xR, y, dcm, dang, dfor = regenerate_cylinder()
     baseL = np.column_stack((xL, y))
     baseR = np.column_stack((xR, y))
 
@@ -265,14 +244,19 @@ for trial in trials:
     dotsR = visual.ElementArrayStim(win_right, nElements=n_dots, elementTex=None, elementMask="circle",
                                     xys=baseR, sizes=dot_size_cm, colors="white")
 
+    update_interval = max(int(DYNAMIC_RDS_UPDATE_EVERY), 1)
+
     for f in range(stim_frames):
-        if DYNAMIC_RDS:
-            xL, xR, y, *_ = generate_rds(
-                a_cm, b, screen_distance_cm, interocular_cm,
-                n_dots, stim_half_height_cm, aperture_radius_cm, screen_width_cm
-            )
-            dotsL.xys = np.column_stack((xL, y))
-            dotsR.xys = np.column_stack((xR, y))
+        if DYNAMIC_RDS and f % update_interval == 0:
+            if f != 0:
+                bank_index = (bank_index + 1) % len(rds_bank)
+                if bank_index == 0:
+                    rds_bank = [regenerate_cylinder() for _ in range(len(rds_bank))]
+                xL_dyn, xR_dyn, y_dyn, *_ = rds_bank[bank_index]
+            else:
+                xL_dyn, xR_dyn, y_dyn = xL, xR, y
+            dotsL.xys = np.column_stack((xL_dyn, y_dyn))
+            dotsR.xys = np.column_stack((xR_dyn, y_dyn))
         fix_left.draw();  fix_right.draw()
         # (no nonius during the actual depth stimulus — reduces distraction)
         dotsL.draw();     dotsR.draw()
@@ -309,6 +293,9 @@ for trial in trials:
     trials.addData("disparity_mean_cm", float(np.mean(dcm)))
     trials.addData("disparity_std_cm", float(np.std(dcm)))
     trials.addData("disparity_angle_mean_deg", float(np.mean(dang) * deg_per_rad))
+    trials.addData("refresh_min_hz", refresh_min_hz)
+    trials.addData("refresh_left_hz", fr_left)
+    trials.addData("refresh_right_hz", fr_right)
     this_exp.nextEntry()
 
 # ============================ CLEANUP ============================
