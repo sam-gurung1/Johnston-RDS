@@ -1,0 +1,367 @@
+import bpy
+import math
+import os 
+
+def setupCamera(distance):
+# Set the camera object to the correct distance and rotation
+    
+    camera = bpy.data.objects['Camera']
+    
+    camera.location = (0, -5, distance)
+    camera.rotation_euler = (math.radians(90), 0, 0)
+    
+def setRenderProperties(res, samples):
+## Set up the render properties using 'Cycles' engine with
+ # 'samples' number of rendering samples
+    
+    # set engine to cycles
+    bpy.context.scene.render.engine = 'CYCLES'
+    
+    # set to render using the GPU
+    bpy.context.scene.cycles.device = 'GPU'
+    
+    # set Render sample count 
+    bpy.context.scene.cycles.samples = samples
+    
+    # set square image dimensions
+    bpy.context.scene.render.resolution_x = res
+    bpy.context.scene.render.resolution_y = res
+    
+def setupClothMaterial():
+# set up the cloth material
+    
+    # remove previous cloth material
+    for m in bpy.data.materials:
+        if m.name == "Cloth":
+            bpy.data.materials.remove(m)
+
+    # Create a new material
+    m = bpy.data.materials.new(name="Cloth")
+    
+    # Set up shader nodes and change defaultvalues
+    m.use_nodes = True
+    
+    color_ramp_node = m.node_tree.nodes.new("ShaderNodeValToRGB")
+    color_ramp_node.color_ramp.elements[0].color = (0.2,0.2,0.2,1)
+    color_ramp_node.color_ramp.elements[1].color = (0.6,0.6,0.6,1)
+    
+    tex_image_node = m.node_tree.nodes.new("ShaderNodeTexImage")
+    tex_coord_node = m.node_tree.nodes.new("ShaderNodeTexCoord")
+    BSDF_node = m.node_tree.nodes.get("Principled BSDF")
+    BSDF_node.inputs["Roughness"].default_value = 1
+    
+    # link the nodes together
+    m.node_tree.links.new(tex_coord_node.outputs["UV"], tex_image_node.inputs[0])
+    m.node_tree.links.new(tex_image_node.outputs["Color"], color_ramp_node.inputs[0])
+    m.node_tree.links.new(color_ramp_node.outputs["Color"], BSDF_node.inputs["Base Color"])
+    
+def setupSceneFloor():
+## Create a 'floor' and set as collision object
+    
+    # add plane to the current collection (it will become the active object)
+    bpy.ops.mesh.primitive_plane_add(size=5)
+    
+    # name the plane (active) as 'Floor'
+    floor = bpy.context.object
+    floor.name = 'Floor'
+    
+    # assign the floor (active) a collision modifier
+    bpy.ops.object.modifier_add(type='COLLISION')
+
+def setupRandTerrain(seed, size, height, noise_depth):
+    
+    # add random terrain based on parameters using A.N.T. Landscape plugin
+    bpy.ops.mesh.landscape_add(mesh_size_x=size, 
+        mesh_size_y=size, 
+        random_seed=seed, 
+        noise_type='hetero_terrain', 
+        basis_type='PERLIN_ORIGINAL', 
+        noise_depth=noise_depth, 
+        height=height, 
+        falloff_x=size, 
+        falloff_y=size, 
+        maximum=height, 
+        minimum=-height, 
+        refresh=True)
+        
+    # name the landscape (active) as 'Terrain'
+    terrain = bpy.context.object
+    terrain.name = 'Terrain'
+    
+    # assign the terrain (active) a collision modifier
+    bpy.ops.object.modifier_add(type='COLLISION')
+
+def setupCloth(subdivs, size, height, frame_end, use_image_textures):
+# sets up and drops cloth (assumes there is a collision surface below the cloth)
+    
+    # add plane to the current collection (it will become the active object)
+    bpy.ops.mesh.primitive_plane_add(size=size, location = (0, 0, height))
+    
+    # name the plane (active) as 'Cloth'
+    cloth = bpy.context.object
+    cloth.name = 'Cloth'
+    
+    # switch the edit mode and subdivide the cloth
+    bpy.ops.object.editmode_toggle()
+    bpy.ops.mesh.subdivide(number_cuts=subdivs)
+    
+    # UV unwrap the cloth to account for subdivisions
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001)
+    
+    # switch back to object mode
+    bpy.ops.object.editmode_toggle()
+    
+    ## Set up cloth behavior
+    # set the Cloth plane to act as a cloth
+    bpy.ops.object.modifier_add(type='CLOTH')
+    
+    # change cloth settings from defaults
+    bpy.context.object.modifiers["Cloth"].settings.quality = 10
+    bpy.context.object.modifiers["Cloth"].settings.mass = 25
+    bpy.context.object.modifiers["Cloth"].settings.tension_stiffness = 30
+    bpy.context.object.modifiers["Cloth"].settings.compression_stiffness = 30
+    bpy.context.object.modifiers["Cloth"].settings.shear_stiffness = 10
+    bpy.context.object.modifiers["Cloth"].collision_settings.collision_quality = 5
+    
+    # set cache settings
+    bpy.context.object.modifiers["Cloth"].point_cache.frame_end = frame_end
+    
+    # bake
+    #bpy.ops.ptcache.bake(bake=True)
+    bpy.ops.ptcache.bake_all()
+    
+    # set to last frame (drop the cloth)
+    bpy.context.scene.frame_set(frame_end)
+    
+    # smooth shading
+    bpy.ops.object.shade_smooth()
+    
+    # Apply the cloth modifier
+    bpy.ops.object.modifier_apply(modifier="Cloth")
+    
+    # Add a subsurf modifier to smooth the cloth
+    bpy.ops.object.modifier_add(type='SUBSURF')
+    
+    bpy.data.objects['Cloth'].rotation_euler = (math.radians(90), 0, 0)
+    
+    if use_image_textures:
+        # Setup the cloth material
+        setupClothMaterial()
+    
+        # Attach the material to the cloth
+        cloth.data.materials.append(bpy.data.materials.get("Cloth"))
+    else:
+        # Attach the material to the cloth
+        cloth.data.materials.append(bpy.data.materials.get("Musgrave"))
+
+def setAmbient():
+    e_node = bpy.data.worlds['World'].node_tree.nodes["Mix Shader"]
+    e_node.inputs[0].default_value = 0
+    
+def applyHDR(image_path):
+# sets Environment Image to the hdr at image_path, assumes that the world material
+# is set up with an Environment textue
+
+    node = bpy.data.worlds['World'].node_tree.nodes["Mix Shader"]
+    node.inputs[0].default_value = 1
+    # Get the environment node tree of the current scene
+    e_node = bpy.data.worlds['World'].node_tree.nodes["Environment Texture"]
+    e_node.image = bpy.data.images.load(image_path)
+    
+
+  
+  
+def applyTexture(image_path):
+# apply a texture image (at image_path) to the "Cloth" material
+    m = bpy.data.materials.get("Cloth")
+    
+    tex = m.node_tree.nodes["Image Texture"]
+    
+    tex.image = bpy.data.images.load(image_path)
+    
+
+def setupCompositing(image_type): # image type refers to whether it is the stimulus or the mask of the stimulus
+    # switch on nodes and get reference
+    bpy.context.scene.use_nodes = True
+    tree = bpy.context.scene.node_tree
+    
+    # clear default nodes
+    for node in tree.nodes:
+        tree.nodes.remove(node)
+        
+    renderLayers_node = tree.nodes.new(type='CompositorNodeRLayers')
+    renderLayers_node.location = -400,0
+    
+    composite_node = tree.nodes.new(type='CompositorNodeComposite')
+    composite_node.location = 400,0
+    
+    alphaOver_node = tree.nodes.new(type='CompositorNodeAlphaOver')
+    alphaOver_node.inputs[1].default_value = 0,0,0,1 # set background image as black
+    alphaOver_node.location = -100,0
+    
+    tree.links.new(renderLayers_node.outputs["Image"], alphaOver_node.inputs[2])
+    
+    bpy.context.scene.view_settings.view_transform = 'Filmic'
+    
+    if image_type == "stimulus":
+        tree.links.new(alphaOver_node.outputs["Image"], composite_node.inputs["Image"]) 
+    
+    if image_type == "mask":
+        colorRamp_node = tree.nodes.new(type='CompositorNodeValToRGB')
+        colorRamp_node.location = 75,0
+        colorRamp_node.color_ramp.interpolation = "CONSTANT"
+        colorRamp_node.color_ramp.elements[1].color = 1,1,1,1
+        colorRamp_node.color_ramp.elements[1].position = 0.001
+        
+        tree.links.new(alphaOver_node.outputs["Image"], colorRamp_node.inputs[0]) 
+        tree.links.new(colorRamp_node.outputs["Image"], composite_node.inputs["Image"]) 
+
+    if image_type == "depth_map":
+        normalize_node = tree.nodes.new(type='CompositorNodeNormalize')
+        tree.links.new(renderLayers_node.outputs["Depth"], normalize_node.inputs["Value"])
+        tree.links.new(normalize_node.outputs["Value"], composite_node.inputs["Image"])
+        
+    if image_type == "normal_map":
+        tree.links.new(renderLayers_node.outputs["Normal"], composite_node.inputs["Image"])
+        bpy.context.scene.view_settings.view_transform = 'Raw'
+        
+def saveImage(save_path, seed, hdr, texture):
+# renders and saves image of current scene 
+
+    # names the image as a string of the seed, hdr, and texture information
+    image_name = 'surf_' + str(seed) + '_hdr_' + str(hdr)+ \
+        '_texture_' + str(texture) + '.tif'
+    
+    # sets save format to PNG
+    scene = bpy.context.scene
+    scene.render.image_settings.file_format='TIFF'
+    
+    # sets filepath to save to
+    scene.render.filepath = save_path + image_name
+    
+    # set up compositing for stimulus
+    setupCompositing('stimulus')
+    
+    # renders and saves image
+    bpy.ops.render.render(write_still=1)
+    
+    print(image_name + " saved.")
+    
+    # save depth map
+    
+    # sets filepath to save to
+    scene.render.filepath = save_path + "//depth_maps//" + "depth_" + image_name
+    
+    # set up compositing for depth map
+    setupCompositing('depth_map')
+    
+    # renders and saves image
+    bpy.ops.render.render(write_still=1)
+    
+    print("depth map " + image_name + " saved.")
+        
+
+def cleanup():
+# delete the previous surface objects to get ready for the next
+    bpy.data.objects['Cloth'].select_set(True)
+    bpy.ops.object.delete()
+    bpy.data.objects['Terrain'].select_set(True)
+    bpy.ops.object.delete()
+    
+    
+    
+########### SCRIPT #########################################################
+
+# Settings
+
+# generation settings
+num_surfaces = 80
+image_res = 512
+use_image_textures = True # if false, use musgrave volumetric texture
+
+
+# stimulus settings
+terrain_size = 4
+terrain_height = 3
+noise_depth = 2
+
+cloth_subdivs = 50
+cloth_size = 5
+drop_height = terrain_height + 0.2
+last_frame = 50
+
+HDR_folder = bpy.path.abspath("//HDRs")
+Texture_folder = bpy.path.abspath("//Textures")
+save_path =  bpy.path.abspath("//Rendered_Images//")
+
+
+HDRs = [os.path.join(HDR_folder, f) for f in os.listdir(HDR_folder) if f.endswith(".png")]
+textures = [os.path.join(Texture_folder, f) for f in os.listdir(Texture_folder)]
+
+setupCamera(distance=3.2)
+setRenderProperties(samples=128, res=image_res)
+setupSceneFloor()
+
+# create light datablock, set attributes
+light_data = bpy.data.lights.new(name="light_2.80", type='POINT')
+light_data.energy = 1000
+
+# create new object with our light datablock
+light_object = bpy.data.objects.new(name="light_2.80", object_data=light_data)
+
+light_object.location = (0, -2, 6)
+
+# link light object
+bpy.context.collection.objects.link(light_object)
+
+
+texture_index = 0
+for surf_seed in range(num_surfaces):
+    
+    setupRandTerrain(seed=surf_seed, 
+        size=terrain_size, 
+        height=terrain_height, 
+        noise_depth=noise_depth)
+        
+    setupCloth(subdivs=cloth_subdivs, 
+        size=cloth_size, 
+        height=drop_height, 
+        frame_end=last_frame,
+        use_image_textures=use_image_textures)
+    
+    # take one image without HDR
+    hdr_index = 0
+    # apply texture
+    texture = textures[texture_index]
+    applyTexture(texture)
+    
+    setAmbient()
+    light_object.location = (0, -2, -60)
+    # render and save the image
+    saveImage(save_path + "Ambient/", surf_seed, hdr_index, texture_index)
+    light_object.location = (0, -2, 6)
+    
+    texture_index = texture_index + 1
+   
+    for HDR in HDRs:
+        
+        print(HDR)
+        # apply current HDR
+        applyHDR(HDR)
+        
+        # apply texture
+        texture = textures[texture_index]
+        applyTexture(texture)
+            
+        # render and save the image
+        saveImage(save_path, surf_seed, hdr_index, texture_index)
+            
+        texture_index = texture_index + 1
+            
+        hdr_index = hdr_index + 1 
+            
+    cleanup() # delete current cloth and terrain
+        
+            
+            
